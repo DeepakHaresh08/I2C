@@ -1,0 +1,1098 @@
+//-----------------------------------------------------------------------------
+// Release:      R1.5_V0_B0
+// Company:      RiRe Technologies Pvt Ltd
+// Author:       Sai / AM
+//
+// Module Name:  i2c_master_fsm
+// Project Name: NETHRA
+//
+// Description:
+//   This is the main control FSM for the I2C Master Controller.
+//   It orchestrates all I2C bus transactions by sequencing through a set of
+//   states that correspond to the I2C protocol phases:
+//     START → Slave Address → ACK → (optional Register Address → ACK) →
+//     Data (Write or Read) → ACK/NACK → STOP
+//
+//   The FSM does NOT directly drive SDA or SCL. Instead it generates
+//   control signals (shift_en, load_en, data_en, start_en, stop_en, etc.)
+//   that are consumed by:
+//     - i2c_serializer    : shifts TX bits onto SDA
+//     - i2c_deserializer  : captures RX bits from SDA
+//     - i2c_sda_scl_ctrl  : physically controls the SDA and SCL pad OE
+//
+// Change from v1.4 base:
+//   - bus_free state and all associated tbuf (bus-free time) logic have been
+//     removed. The FSM now transitions directly from idle → start when
+//     trans_en is asserted and prescale is valid. All other state behaviour,
+//     signal names, and functionality are identical to v1.4.
+//
+// Change from v1.3:
+//   6. Combinatorial SDA Release on ACK: shift_dir is now a 'wire' driven
+//      combinationally. Two conditions force shift_dir LOW:
+//      (a) ack_slot_en is asserted (FSM next_state is any ACK/NACK state),
+//          releasing SDA to the slave before the 9th SCL pulse.
+//      (b) byte_done is asserted while the FSM is in a TX data state
+//          (slave_addr, send_reg_addr, slave_addr_rd, write_data).
+//          This causes shift_dir (= tx_mode) to drop combinatorially in the
+//          same cycle that byte_done fires, so i2c_sda_scl_ctrl sees
+//          tx_mode=0 while still in s_data_high and tristates SDA before
+//          transitioning to s_idle / s_ack_low.  This eliminates the
+//          1-cycle window where the master could still be driving SDA into
+//          the ACK bit period.
+//      The intended direction is preserved in shift_dir_reg and restored
+//      immediately on state exit.
+//-----------------------------------------------------------------------------
+
+module i2c_master_fsm (
+    // -----------------------------------------------------------------------
+    // Clock and Reset
+    // -----------------------------------------------------------------------
+    input  wire        pclk,
+    input  wire        presetn,
+
+    // -----------------------------------------------------------------------
+    // Transaction configuration (from APB register file)
+    // -----------------------------------------------------------------------
+    input  wire        trans_en,
+    input  wire        sw_reset,
+    input  wire [7:0]  xfer_len,
+    input  wire [6:0]  slv_addr,
+    input  wire [7:0]  slv_in_reg_addr,
+    input  wire        rw_dir,
+    input  wire        slv_in_reg_addr_en,
+    input  wire        wdt_en,
+    input  wire [19:0] prescale,
+    input  wire        sm,
+    input  wire        fm,
+    input  wire        fmp,
+    input  wire        tx_fifo_flush,
+    input  wire        rx_fifo_flush,
+    // -----------------------------------------------------------------------
+    // Interrupt enable bits (from register file)
+    // -----------------------------------------------------------------------
+    input  wire        wdt_expry_intrpt_en,
+    input  wire        transfer_done_intrpt_en,
+    input  wire        data_nack_intrpt_en,
+    input  wire        addr_nack_intrpt_en,
+    input  wire        in_reg_addr_nack_intrpt_en,
+    input  wire        line_error_intrpt_en,
+
+    // -----------------------------------------------------------------------
+    // TX FIFO interface
+    // -----------------------------------------------------------------------
+    input  wire [7:0]  tx_data_out,
+    input  wire        tx_fifo_empty_fsm,
+    input  wire        tx_fifo_full_fsm,
+
+    // -----------------------------------------------------------------------
+    // RX FIFO interface
+    // -----------------------------------------------------------------------
+    input  wire        rx_fifo_full_fsm,
+    input  wire        rx_fifo_empty_fsm,
+
+    // -----------------------------------------------------------------------
+    // Filtered bus lines (from debounce block)
+    // -----------------------------------------------------------------------
+    input  wire        scl_in,
+    input  wire        sda_in,
+
+    // -----------------------------------------------------------------------
+    // Watchdog timer
+    // -----------------------------------------------------------------------
+    input  wire        wdt_expry,
+
+    // -----------------------------------------------------------------------
+    // Status / interrupt clear strobes (from register file)
+    // -----------------------------------------------------------------------
+    input  wire [4:0]  ack_status_clr,
+    input  wire [5:0]  intrpt_status_clr,
+
+    // -----------------------------------------------------------------------
+    // Handshake from i2c_sda_scl_ctrl
+    // -----------------------------------------------------------------------
+    input  wire        start_done,
+    input  wire        stop_done,
+    input  wire        repeated_start_done,
+    input  wire        ack_nack_sample,
+    input  wire        line_error,
+
+    // -----------------------------------------------------------------------
+    // Handshake from serializer / deserializer
+    // -----------------------------------------------------------------------
+    input  wire        byte_done,
+
+    // -----------------------------------------------------------------------
+    // Debug / monitoring inputs
+    // -----------------------------------------------------------------------
+    input  wire [3:0]  bit_cnt,
+    input  wire [7:0]  sr_data,
+    // -----------------------------------------------------------------------
+    // SCL timing strobes from i2c_sda_scl_ctrl
+    // -----------------------------------------------------------------------
+    input  wire        scl_tick_in,
+    input  wire        scl_high_in,
+    input  wire        busy_en,
+    // -----------------------------------------------------------------------
+    // Legacy direct pad drive outputs (routed through sda_scl_ctrl)
+    // -----------------------------------------------------------------------
+    output reg         scl_out,
+    output reg         scl_oe,
+    output reg         sda_out,
+    output reg         sda_oe,
+
+    // -----------------------------------------------------------------------
+    // Serializer / Deserializer control
+    // -----------------------------------------------------------------------
+    output reg         tx_rd_en,
+    output reg  [7:0]  rx_data_in,
+    output reg         rx_wr_en,
+    output reg         shift_en,
+    output reg         load_en,
+    output wire        shift_dir,
+    output reg         clr_sr,
+    output reg  [7:0]  sr_load_data,
+
+    // -----------------------------------------------------------------------
+    // Bus condition request outputs → i2c_sda_scl_ctrl
+    // -----------------------------------------------------------------------
+    output reg         start_en,
+    output reg         stop_en,
+    output reg         repeated_start_en,
+    output wire        ack_slot_en,
+    output reg         data_en,
+
+    // -----------------------------------------------------------------------
+    // Direct bus control bypass
+    // -----------------------------------------------------------------------
+    output reg         fsm_bus_ctrl,
+    output reg         sda_out_fsm,
+    output reg         sda_oe_fsm,
+    output reg         scl_out_fsm,
+    output reg         scl_oe_fsm,
+
+    // -----------------------------------------------------------------------
+    // SCL generator enable
+    // -----------------------------------------------------------------------
+    output reg         scl_en,
+
+    // -----------------------------------------------------------------------
+    // Status outputs → register file
+    // -----------------------------------------------------------------------
+    output reg         wdt_expry_out,
+    output reg  [7:0]  bytes_xferd,
+    output reg         busy,
+    output reg         xfer_done,
+    output reg         in_reg_addr_ack_out,
+    output reg         slv_addr_ack_out,
+    output reg         early_nack_out,
+    output reg         master_nack_sent_out,
+
+    // -----------------------------------------------------------------------
+    // Interrupt outputs
+    // -----------------------------------------------------------------------
+    output reg         wdt_expry_intrpt,
+    output reg         transfer_done_intrpt,
+    output reg         data_nack_intrpt,
+    output reg         addr_nack_intrpt,
+    output reg         reg_addr_nack_intrpt,
+    output reg         line_error_intrpt,
+
+    // -----------------------------------------------------------------------
+    // Debug outputs → register file
+    // -----------------------------------------------------------------------
+    output reg  [3:0]  fsm_state,
+    output reg  [3:0]  last_fsm_state,
+    output reg  [7:0]  last_byte,
+    output reg  [3:0]  error_code,
+    output reg  [3:0]  bit_count,
+    output reg  [3:0]  byte_count,
+    output reg         sda_sample_out,
+    output reg         scl_sample_out,
+    output reg         debug_valid_out,
+
+    output wire        i2c_interrupt
+);
+
+// ===========================================================================
+// State encodings
+// ---------------------------------------------------------------------------
+// bus_free state has been removed. idle now transitions directly to start.
+// All remaining state values are unchanged from v1.4.
+// ===========================================================================
+  // State encoding: 4'd0
+  // Quiescent state. No bus activity. Waits for trans_en && prescale_valid.
+  // Transitions directly to start (4'd1) — no bus_free wait in this variant.
+  localparam [3:0] idle           = 4'd0;
+
+// 4'd1 is intentionally unassigned (was bus_free — removed)
+
+  // State encoding: 4'd1
+  // Generates the I2C START condition via start_en → i2c_sda_scl_ctrl.
+  // busy and scl_en are asserted here (previously done in bus_free).
+  // Exits to slave_addr (4'd2) on start_done.
+  localparam [3:0] start          = 4'd1;
+
+  // State encoding: 4'd2
+  // Shifts 7-bit slave address + R/W bit (8 bits) onto SDA in TX direction.
+  // Loads {slv_addr, rw_dir-or-0} into shift register on state entry.
+  // Exits to ack_addr (4'd3) on byte_done.
+  localparam [3:0] slave_addr     = 4'd2;
+
+  // State encoding: 4'd3
+  // Releases SDA (shift_dir forced 0 via ack_slot_en) and samples the 9th
+  // SCL pulse for slave ACK/NACK.
+  // ACK  → send_reg_addr (4'd4) / write_data (4'd9) / read_data (4'd11)
+  // NACK → stop (4'd14), sets err_addr_nack, early_nack_out, addr_nack_intrpt.
+  localparam [3:0] ack_addr       = 4'd3;
+
+  // State encoding: 4'd4
+  // Shifts 8-bit internal register address onto SDA in TX direction.
+  // Loads slv_in_reg_addr into shift register on state entry.
+  // Exits to ack_reg_addr (4'd5) on byte_done.
+  localparam [3:0] send_reg_addr  = 4'd4;
+
+  // State encoding: 4'd5
+  // Releases SDA and samples the 9th SCL pulse for slave ACK/NACK after
+  // the register address byte.
+  // ACK + write → write_data (4'd9)
+  // ACK + read  → repeated_start (4'd6)
+  // NACK        → stop (4'd14), sets err_reg_addr_nack, reg_addr_nack_intrpt.
+  localparam [3:0] ack_reg_addr   = 4'd5;
+
+  // State encoding: 4'd6
+  // Issues a Repeated-START condition via repeated_start_en → i2c_sda_scl_ctrl
+  // without releasing the bus, so master can re-address slave in read direction.
+  // Exits to slave_addr_rd (4'd7) on repeated_start_done.
+  localparam [3:0] repeated_start = 4'd6;
+
+  // State encoding: 4'd7
+  // Shifts 7-bit slave address + R/W=1 (read, 8 bits) onto SDA in TX direction.
+  // Loads {slv_addr, 1'b1} into shift register on state entry.
+  // Exits to ack_addr_rd (4'd8) on byte_done.
+  localparam [3:0] slave_addr_rd  = 4'd7;
+
+  // State encoding: 4'd8
+  // Releases SDA and samples the 9th SCL pulse for slave ACK/NACK after the
+  // read-direction address byte.
+  // ACK  → read_data (4'd11), sets slv_addr_ack_out.
+  // NACK → stop (4'd14), sets err_addr_nack, addr_nack_intrpt.
+  localparam [3:0] ack_addr_rd    = 4'd8;
+
+  // State encoding: 4'd9
+  // Pops one byte from TX FIFO and shifts it onto SDA in TX direction.
+  // tx_rd_en → tx_data_valid → load_en → data_en → shift_en per SCL tick.
+  // Exits to ack_write (4'd10) on byte_done.
+  localparam [3:0] write_data     = 4'd9;
+
+  // State encoding: 4'd10
+  // Releases SDA and samples the 9th SCL pulse for slave ACK/NACK after
+  // each written data byte.
+  // ACK + more bytes → write_data (4'd9), increments byte_cnt/bytes_xferd.
+  // ACK + last byte  → stop (4'd14), increments byte_cnt/bytes_xferd.
+  // NACK             → stop (4'd14), sets early_nack_out, err_data_nack,
+  //                    data_nack_intrpt.
+  localparam [3:0] ack_write      = 4'd10;
+
+  // State encoding: 4'd11
+  // Tristates SDA (shift_dir_reg=0, RX direction) and clocks in 8 bits
+  // from the slave. On byte_done: captures sr_data, asserts rx_wr_en,
+  // increments byte_cnt/bytes_xferd.
+  // More bytes && !rx_fifo_full → master_ack (4'd12).
+  // Last byte  || rx_fifo_full  → master_nack (4'd13).
+  localparam [3:0] read_data      = 4'd11;
+
+  // State encoding: 4'd12
+  // Master drives SDA LOW (sda_out_fsm=0, sda_oe_fsm=1) to ACK the received
+  // byte, signalling to the slave that more bytes are expected.
+  // Exits to read_data (4'd11) on ack_slot_sent && SCL falling edge.
+  localparam [3:0] master_ack     = 4'd12;
+
+  // State encoding: 4'd13
+  // Master releases SDA (sda_oe_fsm=0, sda_out_fsm=1) to NACK the last
+  // received byte, ending the read transfer.
+  // Sets master_nack_sent_out when NACK slot is confirmed.
+  // Exits to stop (4'd14) on ack_slot_sent && SCL falling edge.
+  localparam [3:0] master_nack    = 4'd13;
+
+  // State encoding: 4'd14
+  // Generates the I2C STOP condition via stop_en → i2c_sda_scl_ctrl.
+  // On stop_done: deasserts busy, asserts xfer_done, disables scl_en,
+  // fires transfer_done_intrpt if enabled.
+  // Transitions to idle (4'd0) — bus_free removed in this variant.
+  localparam [3:0] stop           = 4'd14;
+
+localparam [3:0] err_none          = 4'd0;
+localparam [3:0] err_addr_nack     = 4'd1;
+localparam [3:0] err_reg_addr_nack = 4'd2;
+localparam [3:0] err_data_nack     = 4'd3;
+localparam [3:0] err_wdt_timeout   = 4'd4;
+localparam [3:0] err_line_error    = 4'd5;
+
+// ===========================================================================
+// Internal registers
+// ---------------------------------------------------------------------------
+// tbuf_cnt, tbuf_done, eff_tbuf removed — no bus_free state.
+// All other internal registers unchanged.
+// ===========================================================================
+reg [3:0]  state;
+reg [3:0]  next_state;
+reg [7:0]  byte_cnt;
+reg        tx_fifo_pop_pending;
+reg        tx_data_valid;
+reg        err_active;
+reg        state_entry;
+reg        ack_slot_sent;
+reg        load_pending;
+reg        data_en_pending;
+reg        ack_nack_sample_q;
+reg        shift_dir_reg;
+
+// ===========================================================================
+// Registered ACK/NACK sample
+// ===========================================================================
+always @(posedge pclk or negedge presetn) begin
+    if (!presetn) ack_nack_sample_q <= 1'b1;
+    else          ack_nack_sample_q <= ack_nack_sample;
+end
+
+// ===========================================================================
+// Combinatorial ACK-state detection → ack_slot_en (v1.3)
+// ===========================================================================
+wire is_ack_state = (next_state == ack_addr)    ||
+                    (next_state == ack_reg_addr) ||
+                    (next_state == ack_addr_rd)  ||
+                    (next_state == ack_write)    ||
+                    (next_state == master_ack)   ||
+                    (next_state == master_nack);
+
+assign ack_slot_en = is_ack_state;
+
+// ===========================================================================
+// v1.4: TX data state identification
+// ===========================================================================
+wire in_tx_data_state = (state == slave_addr)   ||
+                        (state == send_reg_addr) ||
+                        (state == slave_addr_rd) ||
+                        (state == write_data);
+
+// ===========================================================================
+// v1.4: Combinatorial shift_dir
+// ===========================================================================
+assign shift_dir = (ack_slot_en || (byte_done && in_tx_data_state))
+                   ? 1'b0 : shift_dir_reg;
+
+reg prescale_valid;
+  always @(posedge pclk or negedge presetn)
+    begin
+      if(prescale==250 && sm)
+      prescale_valid<=1;
+      else if(prescale==62 && fm)
+      prescale_valid<=1;
+      else if( prescale==25  && fmp)
+    prescale_valid<=1;
+  else
+    prescale_valid<=0;
+    end
+  
+  
+    
+// ===========================================================================
+// State-entry detection and ACK slot tracking
+// ===========================================================================
+always @(posedge pclk or negedge presetn) begin
+    if (!presetn) begin
+        state_entry   <= 1'b0;
+        ack_slot_sent <= 1'b0;
+    end else begin
+        state_entry <= (state != next_state);
+        if (state != next_state) begin
+            ack_slot_sent <= 1'b0;
+        end else if (ack_slot_en) begin
+            ack_slot_sent <= 1'b1;
+        end
+    end
+end
+
+// ===========================================================================
+// FSM sequential (state register)
+// ===========================================================================
+always @(posedge pclk or negedge presetn) begin
+    if (!presetn) begin
+        state          <= idle;
+        last_fsm_state <= idle;
+        err_active     <= 1'b0;
+    end else begin
+        last_fsm_state <= state;
+        state          <= next_state;
+        if (err_active) begin
+            err_active <= 1'b0;
+        // Note: state != bus_free guard removed — idle check is sufficient
+        end else if ((wdt_expry && wdt_en && state != idle) ||
+                     (line_error && state != idle)) begin
+            err_active <= 1'b1;
+        end
+    end
+end
+
+// ===========================================================================
+// Next-state logic (combinatorial)
+// ---------------------------------------------------------------------------
+// bus_free removed: idle → start directly on trans_en && prescale_valid.
+// stop → idle (was stop → bus_free).
+// All other transitions unchanged.
+// ===========================================================================
+always @(*) begin
+    next_state = state;
+  if (sw_reset || err_active) begin
+        next_state = idle;
+    end else if (wdt_expry && wdt_en && state != idle) begin
+        next_state = idle;
+    end else if (line_error && state != idle) begin
+        next_state = idle;
+    end
+  else if(tx_fifo_flush || rx_fifo_flush)
+    next_state = stop;
+    else begin
+        case (state)
+
+            // idle (4'd0): go directly to start (no bus_free wait)
+            idle : begin
+              if (trans_en && prescale_valid)
+                    next_state = start;
+            end
+
+            // start (4'd1): wait for START condition to complete
+            start : begin
+                if (start_done) next_state = slave_addr;
+             
+            end
+
+            // slave_addr (4'd2): wait for all 8 address bits to be shifted out
+            slave_addr : begin
+                if (byte_done) next_state = ack_addr;
+            end
+
+            // ack_addr (4'd3): sample slave ACK/NACK for the address byte
+            ack_addr : begin
+                if (ack_slot_sent && scl_tick_in && !scl_high_in) begin
+                    if (!ack_nack_sample_q) begin
+                        if (slv_in_reg_addr_en)  next_state = send_reg_addr;
+                        else if (!rw_dir)         next_state = write_data;
+                        else                      next_state = read_data;
+                    end else                      next_state = stop;
+                  if(xfer_len==0)
+                    next_state=stop;
+                end
+            end
+
+            // send_reg_addr (4'd4): wait for all 8 register address bits to shift out
+            send_reg_addr : begin
+                if (byte_done) next_state = ack_reg_addr;
+            end
+
+            // ack_reg_addr (4'd5): sample slave ACK/NACK for the register address byte
+            ack_reg_addr : begin
+                if (ack_slot_sent && scl_tick_in && !scl_high_in) begin
+                    if (!ack_nack_sample_q) begin
+                        if (!rw_dir) next_state = write_data;
+                        else         next_state = repeated_start;
+                    end else         next_state = stop;
+                end
+            end
+
+            // repeated_start (4'd6): wait for Repeated-START condition to complete
+            repeated_start : begin
+                if (repeated_start_done) next_state = slave_addr_rd;
+            end
+
+            // slave_addr_rd (4'd7): wait for all 8 read-direction address bits to shift out
+            slave_addr_rd : begin
+                if (byte_done) next_state = ack_addr_rd;
+            end
+
+            // ack_addr_rd (4'd8): sample slave ACK/NACK for the read-direction address byte
+            ack_addr_rd : begin
+                if (ack_slot_sent && scl_tick_in && !scl_high_in) begin
+                    if (!ack_nack_sample_q) next_state = read_data;
+                    else                    next_state = stop;
+                end
+            end
+
+            // write_data (4'd9): wait for all 8 data bits to be shifted out
+            write_data : begin
+                if (byte_done) next_state = ack_write;
+                else           next_state = write_data;
+            end
+
+            // ack_write (4'd10): sample slave ACK/NACK for each written data byte
+            ack_write : begin
+                if (ack_slot_sent && scl_tick_in && !scl_high_in) begin
+                    if (!ack_nack_sample_q) begin
+                        if (byte_cnt < xfer_len - 8'd1) next_state = write_data;
+                        else                            next_state = stop;
+                    end else                            next_state = stop;
+                end
+            end
+
+            // read_data (4'd11): wait for all 8 data bits to be clocked in from slave
+            read_data : begin
+                if (byte_done) begin
+                    if ((byte_cnt < xfer_len - 8'd1) && !rx_fifo_full_fsm)
+                         next_state = master_ack;
+                    else next_state = master_nack;
+                end
+            end
+
+            // master_ack (4'd12): master drives SDA LOW to ACK — more bytes expected
+            master_ack : begin
+                if (ack_slot_sent && scl_tick_in && !scl_high_in)
+                    next_state = read_data;
+            end
+
+            // master_nack (4'd13): master releases SDA to NACK — last byte received
+            master_nack : begin
+                if (ack_slot_sent && scl_tick_in && !scl_high_in)
+                    next_state = stop;
+            end
+
+            // stop (4'd14) → idle (4'd0) directly (bus_free removed)
+            stop : begin
+              if (stop_done) next_state = stop;
+            end
+
+            default : next_state = idle;
+
+        endcase
+    end
+end
+
+// ===========================================================================
+// Output / control register block
+// ===========================================================================
+always @(posedge pclk or negedge presetn) begin
+    if (!presetn) begin
+        scl_out              <= 1'b1;
+        scl_oe               <= 1'b0;
+        sda_out              <= 1'b1;
+        sda_oe               <= 1'b0;
+        tx_rd_en             <= 1'b0;
+        rx_wr_en             <= 1'b0;
+        rx_data_in           <= 8'h00;
+        shift_en             <= 1'b0;
+        load_en              <= 1'b0;
+        shift_dir_reg        <= 1'b1;
+        clr_sr               <= 1'b0;
+        sr_load_data         <= 8'h00;
+        start_en             <= 1'b0;
+        stop_en              <= 1'b0;
+        repeated_start_en    <= 1'b0;
+        data_en              <= 1'b0;
+        fsm_bus_ctrl         <= 1'b0;
+        sda_out_fsm          <= 1'b1;
+        sda_oe_fsm           <= 1'b0;
+        scl_out_fsm          <= 1'b1;
+        scl_oe_fsm           <= 1'b0;
+        scl_en               <= 1'b0;
+        busy                 <= 1'b0;
+        xfer_done            <= 1'b0;
+        bytes_xferd          <= 8'h00;
+        wdt_expry_out        <= 1'b0;
+        slv_addr_ack_out     <= 1'b0;
+        in_reg_addr_ack_out  <= 1'b0;
+        early_nack_out       <= 1'b0;
+        master_nack_sent_out <= 1'b0;
+        wdt_expry_intrpt     <= 1'b0;
+        transfer_done_intrpt <= 1'b0;
+        data_nack_intrpt     <= 1'b0;
+        addr_nack_intrpt     <= 1'b0;
+        reg_addr_nack_intrpt <= 1'b0;
+        line_error_intrpt    <= 1'b0;
+        fsm_state            <= idle;
+        last_byte            <= 8'h00;
+        error_code           <= err_none;
+        bit_count            <= 4'd0;
+        byte_count           <= 4'd0;
+        sda_sample_out       <= 1'b0;
+        scl_sample_out       <= 1'b0;
+        debug_valid_out      <= 1'b0;
+        byte_cnt             <= 8'h00;
+        tx_fifo_pop_pending  <= 1'b0;
+        tx_data_valid        <= 1'b0;
+        load_pending         <= 1'b0;
+        data_en_pending      <= 1'b0;
+    end 
+  else if((byte_cnt<xfer_len-1) && tx_fifo_empty_fsm)
+            scl_en <= 1'b0;
+    
+    else begin
+        // Default: clear all single-cycle pulse outputs
+        tx_rd_en          <= 1'b0;
+        rx_wr_en          <= 1'b0;
+        shift_en          <= 1'b0;
+        load_en           <= 1'b0;
+        clr_sr            <= 1'b0;
+        start_en          <= 1'b0;
+        stop_en           <= 1'b0;
+        repeated_start_en <= 1'b0;
+        data_en           <= 1'b0;
+        xfer_done         <= 1'b0;
+
+        // Software-initiated status / interrupt clears
+        if (ack_status_clr[4]) in_reg_addr_ack_out  <= 1'b0;
+        if (ack_status_clr[2]) slv_addr_ack_out     <= 1'b0;
+        if (ack_status_clr[1]) early_nack_out       <= 1'b0;
+        if (ack_status_clr[0]) master_nack_sent_out <= 1'b0;
+        if (intrpt_status_clr[5]) wdt_expry_intrpt     <= 1'b0;
+        if (intrpt_status_clr[4]) transfer_done_intrpt <= 1'b0;
+        if (intrpt_status_clr[3]) data_nack_intrpt     <= 1'b0;
+        if (intrpt_status_clr[2]) addr_nack_intrpt     <= 1'b0;
+        if (intrpt_status_clr[1]) reg_addr_nack_intrpt <= 1'b0;
+        if (intrpt_status_clr[0]) line_error_intrpt    <= 1'b0;
+
+        fsm_state      <= next_state;
+        sda_sample_out <= sda_in;
+        scl_sample_out <= scl_in;
+        bit_count      <= bit_cnt;
+        fsm_bus_ctrl   <= 1'b0;
+     
+
+        // ==================================================================
+        // Priority 1: Software reset
+        // ==================================================================
+        if (sw_reset) begin
+            scl_oe              <= 1'b0;
+            sda_oe              <= 1'b0;
+            scl_out             <= 1'b1;
+            sda_out             <= 1'b1;
+            fsm_bus_ctrl        <= 1'b0;
+            scl_oe_fsm          <= 1'b0;
+            sda_oe_fsm          <= 1'b0;
+            scl_en              <= 1'b0;
+            clr_sr              <= 1'b1;
+            busy                <= 1'b0;
+            byte_cnt            <= 8'h00;
+            bytes_xferd         <= 8'h00;
+            error_code          <= err_none;
+            debug_valid_out     <= 1'b0;
+            tx_fifo_pop_pending <= 1'b0;
+            tx_data_valid       <= 1'b0;
+            load_pending        <= 1'b0;
+            data_en_pending     <= 1'b0;
+            shift_dir_reg       <= 1'b1;
+
+        // ==================================================================
+        // Priority 2: Watchdog timeout
+        // Note: state != bus_free guard removed — idle check is sufficient
+        // ==================================================================
+        end else if (wdt_expry && wdt_en && state != idle) begin
+            scl_oe          <= 1'b0;
+            sda_oe          <= 1'b0;
+            scl_out         <= 1'b1;
+            sda_out         <= 1'b1;
+            fsm_bus_ctrl    <= 1'b0;
+            scl_oe_fsm      <= 1'b0;
+            sda_oe_fsm      <= 1'b0;
+            scl_en          <= 1'b0;
+            clr_sr          <= 1'b1;
+            busy            <= 1'b0;
+            wdt_expry_out   <= 1'b1;
+            error_code      <= err_wdt_timeout;
+            last_byte       <= sr_load_data;
+            byte_count      <= byte_cnt[3:0];
+            debug_valid_out <= 1'b1;
+            if (wdt_expry_intrpt_en) wdt_expry_intrpt <= 1'b1;
+
+        // ==================================================================
+        // Priority 3: Line error
+        // Note: state != bus_free guard removed
+        // ==================================================================
+        end else if (line_error && state != idle) begin
+            scl_oe          <= 1'b0;
+            sda_oe          <= 1'b0;
+            scl_out         <= 1'b1;
+            sda_out         <= 1'b1;
+            fsm_bus_ctrl    <= 1'b0;
+            scl_oe_fsm      <= 1'b0;
+            sda_oe_fsm      <= 1'b0;
+            scl_en          <= 1'b0;
+            clr_sr          <= 1'b1;
+            busy            <= 1'b0;
+            error_code      <= err_line_error;
+            last_byte       <= sr_load_data;
+            byte_count      <= byte_cnt[3:0];
+            debug_valid_out <= 1'b1;
+            if (line_error_intrpt_en) line_error_intrpt <= 1'b1;
+          
+
+        //  ============= =====================================================
+        // Normal operation: state-specific output logic
+        // ==================================================================
+        end else begin
+            case (state)
+
+                // -----------------------------------------------------------
+                // idle (4'd0)
+                // IDLE: go directly to start on next cycle when trans_en set.
+                // bus_free output block removed entirely — no scl_en=1,
+                // no fsm_bus_ctrl hold, no busy assert here.
+                // busy is asserted in start instead.
+                // -----------------------------------------------------------
+                idle : begin
+                    scl_oe              <= 1'b0;
+                    sda_oe              <= 1'b0;
+                    scl_out             <= 1'b1;
+                    sda_out             <= 1'b1;
+                    fsm_bus_ctrl        <= 1'b0;
+                    scl_oe_fsm          <= 1'b0;
+                    sda_oe_fsm          <= 1'b0;
+                    scl_en              <= 1'b0;
+                    busy                <= 1'b0;
+                    byte_cnt            <= 8'h00;
+                    bytes_xferd         <= 8'h00;
+                    debug_valid_out     <= 1'b0;
+                    error_code          <= err_none;
+                    tx_fifo_pop_pending <= 1'b0;
+                    tx_data_valid       <= 1'b0;
+                    load_pending        <= 1'b0;
+                    data_en_pending     <= 1'b0;
+                end
+
+                // -----------------------------------------------------------
+                // start (4'd1)
+                // START: first active state after idle.
+                // busy is asserted here (was in bus_free before).
+                // SCL generator enabled here (was in bus_free before).
+                // -----------------------------------------------------------
+                start : begin
+                   if(busy_en)  
+                         busy  <= 1'b1;
+                        // Mark transfer in progress
+                    fsm_bus_ctrl <= 1'b1;
+                    scl_oe_fsm   <= 1'b0;
+                    sda_oe_fsm   <= 1'b1;
+                    sda_out_fsm  <= 1'b0;
+                    scl_en       <= 1'b1;      // Enable SCL generator
+                    if (state_entry) begin
+                        start_en <= 1'b1;
+                      
+                       
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // slave_addr (4'd2)
+                // Loads and serially shifts {slv_addr, rw_bit} onto SDA.
+                // shift_dir_reg=1 (TX). Uses load_pending / data_en_pending
+                // handshake to pipeline load_en → data_en → shift_en.
+                // -----------------------------------------------------------
+                slave_addr : begin
+                    shift_dir_reg <= 1'b1;
+                    scl_en        <= 1'b1;
+                    if (state_entry) begin
+                        load_en      <= 1'b1;
+                        sr_load_data <= {slv_addr, (slv_in_reg_addr_en ? 1'b0 : rw_dir)};
+                        load_pending <= 1'b1;
+                    end else if (load_pending) begin
+                        data_en         <= 1'b1;
+                        load_pending    <= 1'b0;
+                    end else if (data_en_pending && byte_done) begin
+                        data_en_pending <= 1'b0;
+                    end else if (data_en_pending) begin
+                        data_en         <= 1'b1;
+                        data_en_pending <= 1'b0;
+                    end else if (scl_tick_in && !scl_high_in && !byte_done
+                                 && !load_pending && !data_en_pending) begin
+                        shift_en        <= 1'b1;
+                        data_en_pending <= 1'b1;
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // ack_addr (4'd3)
+                // Releases SDA to slave; samples ACK/NACK on 9th SCL pulse.
+                // Sets slv_addr_ack_out on ACK; sets error signals on NACK.
+                // -----------------------------------------------------------
+                ack_addr : begin
+                    fsm_bus_ctrl <= 1'b1;
+                    sda_oe_fsm   <= 1'b0;
+                    scl_oe_fsm   <= 1'b0;
+                    scl_en       <= 1'b1;
+                    if (ack_slot_sent && scl_tick_in && !scl_high_in) begin
+                        if (!ack_nack_sample_q) begin
+                            slv_addr_ack_out <= 1'b1;
+                            last_byte        <= sr_load_data;
+                            debug_valid_out  <= 1'b1;
+                        end else begin
+                            error_code      <= err_addr_nack;
+                            early_nack_out  <= 1'b1;
+                            debug_valid_out <= 1'b1;
+                            if (addr_nack_intrpt_en) addr_nack_intrpt <= 1'b1;
+                        end
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // send_reg_addr (4'd4)
+                // Loads and serially shifts slv_in_reg_addr onto SDA.
+                // shift_dir_reg=1 (TX). Same load/data/shift pipeline as
+                // slave_addr (4'd2).
+                // -----------------------------------------------------------
+                send_reg_addr : begin
+                    shift_dir_reg <= 1'b1;
+                    scl_en        <= 1'b1;
+                    if (state_entry) begin
+                        load_en      <= 1'b1;
+                        sr_load_data <= slv_in_reg_addr;
+                        load_pending <= 1'b1;
+                    end else if (load_pending) begin
+                        data_en         <= 1'b1;
+                        load_pending    <= 1'b0;
+                    end else if (data_en_pending && byte_done) begin
+                        data_en_pending <= 1'b0;
+                    end else if (data_en_pending) begin
+                        data_en         <= 1'b1;
+                        data_en_pending <= 1'b0;
+                    end else if (scl_tick_in && !scl_high_in && !byte_done
+                                 && !load_pending && !data_en_pending) begin
+                        shift_en        <= 1'b1;
+                        data_en_pending <= 1'b1;
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // ack_reg_addr (4'd5)
+                // Releases SDA; samples ACK/NACK after register address byte.
+                // Sets in_reg_addr_ack_out on ACK; sets error on NACK.
+                // -----------------------------------------------------------
+                ack_reg_addr : begin
+                    fsm_bus_ctrl <= 1'b1;
+                    sda_oe_fsm   <= 1'b0;
+                    scl_oe_fsm   <= 1'b0;
+                    scl_en       <= 1'b1;
+                    if (ack_slot_sent && scl_tick_in && !scl_high_in) begin
+                        if (!ack_nack_sample_q) begin
+                            in_reg_addr_ack_out <= 1'b1;
+                        end else begin
+                            error_code      <= err_reg_addr_nack;
+                            debug_valid_out <= 1'b1;
+                            if (in_reg_addr_nack_intrpt_en) reg_addr_nack_intrpt <= 1'b1;
+                        end
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // repeated_start (4'd6)
+                // Asserts repeated_start_en on state entry and holds until
+                // repeated_start_done is received from i2c_sda_scl_ctrl.
+                // -----------------------------------------------------------
+                repeated_start : begin
+                    fsm_bus_ctrl <= 1'b1;
+                    scl_oe_fsm   <= 1'b0;
+                    sda_oe_fsm   <= 1'b0;
+                    scl_en       <= 1'b1;
+                    if (state_entry) repeated_start_en <= 1'b1;
+                end
+
+                // -----------------------------------------------------------
+                // slave_addr_rd (4'd7)
+                // Loads and serially shifts {slv_addr, 1'b1} (read) onto SDA.
+                // shift_dir_reg=1 (TX). Same load/data/shift pipeline as
+                // slave_addr (4'd2).
+                // -----------------------------------------------------------
+                slave_addr_rd : begin
+                    shift_dir_reg <= 1'b1;
+                    scl_en        <= 1'b1;
+                    if (state_entry) begin
+                        load_en      <= 1'b1;
+                        sr_load_data <= {slv_addr, 1'b1};
+                        load_pending <= 1'b1;
+                    end else if (load_pending) begin
+                        data_en         <= 1'b1;
+                        load_pending    <= 1'b0;
+                    end else if (data_en_pending && byte_done) begin
+                        data_en_pending <= 1'b0;
+                    end else if (data_en_pending) begin
+                        data_en         <= 1'b1;
+                        data_en_pending <= 1'b0;
+                    end else if (scl_tick_in && !scl_high_in && !byte_done
+                                 && !load_pending && !data_en_pending) begin
+                        shift_en        <= 1'b1;
+                        data_en_pending <= 1'b1;
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // ack_addr_rd (4'd8)
+                // Releases SDA; samples ACK/NACK after read-direction address.
+                // Sets slv_addr_ack_out on ACK; sets error on NACK.
+                // -----------------------------------------------------------
+                ack_addr_rd : begin
+                    fsm_bus_ctrl <= 1'b1;
+                    sda_oe_fsm   <= 1'b0;
+                    scl_oe_fsm   <= 1'b0;
+                    scl_en       <= 1'b1;
+                    if (ack_slot_sent && scl_tick_in && !scl_high_in) begin
+                        if (!ack_nack_sample_q) begin
+                            slv_addr_ack_out <= 1'b1;
+                        end else begin
+                            error_code      <= err_addr_nack;
+                            debug_valid_out <= 1'b1;
+                            if (addr_nack_intrpt_en) addr_nack_intrpt <= 1'b1;
+                        end
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // write_data (4'd9)
+                // Pops one byte from TX FIFO and serially shifts it onto SDA.
+                // shift_dir_reg=1 (TX). Two-cycle FIFO pop latency managed via
+                // tx_fifo_pop_pending and tx_data_valid flags.
+                // -----------------------------------------------------------
+                write_data : begin
+                    shift_dir_reg <= 1'b1;
+                    scl_en        <= 1'b1;
+                  if (!tx_fifo_pop_pending && !tx_data_valid) begin
+                        tx_rd_en            <= 1'b1;
+                    tx_fifo_pop_pending     <= 1'b1;
+                    end
+                    if (tx_fifo_pop_pending) begin
+                        tx_fifo_pop_pending <= 1'b0;
+                        tx_data_valid       <= 1'b1;
+                        load_en             <= 1'b1;
+                        sr_load_data        <= tx_data_out;
+                        load_pending        <= 1'b1;
+                    end else if (load_pending) begin
+                        data_en         <= 1'b1;
+                        load_pending    <= 1'b0;
+                    end else if (data_en_pending && byte_done) begin
+                        data_en_pending <= 1'b0;
+                    end else if (tx_data_valid && scl_tick_in && !scl_high_in
+                                 && !byte_done && !load_pending && !data_en_pending) begin
+                        shift_en        <= 1'b1;
+                        data_en_pending <= 1'b1;
+                    end else if (data_en_pending) begin
+                        data_en         <= 1'b1;
+                        data_en_pending <= 1'b0;
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // ack_write (4'd10)
+                // Releases SDA; samples ACK/NACK after each written data byte.
+                // On ACK: increments byte_cnt/bytes_xferd, clears FIFO flags.
+                // On NACK: sets early_nack_out, err_data_nack, data_nack_intrpt.
+                // -----------------------------------------------------------
+                ack_write : begin
+                    fsm_bus_ctrl <= 1'b1;
+                    sda_oe_fsm   <= 1'b0;
+                    scl_oe_fsm   <= 1'b0;
+                    scl_en       <= 1'b1;
+                    if (ack_slot_sent && scl_tick_in && !scl_high_in) begin
+                        if (!ack_nack_sample_q) begin
+                            byte_cnt            <= byte_cnt + 8'd1;
+                            bytes_xferd         <= byte_cnt + 8'd1;
+                            last_byte           <= sr_load_data;
+                            byte_count          <= byte_cnt[3:0] + 4'd1;
+                            tx_fifo_pop_pending <= 1'b0;
+                            tx_data_valid       <= 1'b0;
+                        end else begin
+                            early_nack_out  <= 1'b1;
+                            error_code      <= err_data_nack;
+                            debug_valid_out <= 1'b1;
+                            if (data_nack_intrpt_en) data_nack_intrpt <= 1'b1;
+                        end
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // read_data (4'd11)
+                // Tristates SDA (shift_dir_reg=0, RX direction) and clocks in
+                // 8 bits from the slave. On byte_done: writes sr_data to
+                // rx_data_in, asserts rx_wr_en, increments byte_cnt/bytes_xferd.
+                // -----------------------------------------------------------
+                read_data : begin
+                    shift_dir_reg <= 1'b0;
+                    scl_en        <= 1'b1;
+                  if (scl_tick_in && !scl_high_in)               shift_en <= 1'b1;
+                    if (byte_done) begin
+                        rx_data_in  <= sr_data;
+                        rx_wr_en    <= 1'b1;
+                        byte_cnt    <= byte_cnt + 8'd1;
+                        bytes_xferd <= byte_cnt + 8'd1;
+                        last_byte   <= sr_data;
+                        byte_count  <= byte_cnt[3:0] + 4'd1;
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // master_ack (4'd12)
+                // Master drives SDA LOW (sda_out_fsm=0, sda_oe_fsm=1) to send
+                // ACK to slave, indicating more bytes are expected.
+                // -----------------------------------------------------------
+                master_ack : begin
+                    fsm_bus_ctrl <= 1'b1;
+                    sda_out_fsm  <= 1'b0;
+                    sda_oe_fsm   <= 1'b1;
+                    scl_oe_fsm   <= 1'b0;
+                    scl_en       <= 1'b1;
+                end
+
+                // -----------------------------------------------------------
+                // master_nack (4'd13)
+                // Master releases SDA (sda_oe_fsm=0, sda_out_fsm=1) to send
+                // NACK to slave, signalling end of read transfer.
+                // Sets master_nack_sent_out when NACK slot is confirmed.
+                // -----------------------------------------------------------
+                master_nack : begin
+                    fsm_bus_ctrl <= 1'b1;
+                    sda_out_fsm  <= 1'b1;
+                    sda_oe_fsm   <= 1'b0;
+                    scl_oe_fsm   <= 1'b0;
+                    scl_en       <= 1'b1;
+                    if (ack_slot_sent && scl_tick_in && !scl_high_in)
+                        master_nack_sent_out <= 1'b1;
+                end
+
+                // -----------------------------------------------------------
+                // stop (4'd14)
+                // Asserts stop_en on state entry; waits for stop_done from
+                // i2c_sda_scl_ctrl. On stop_done: deasserts busy, asserts
+                // xfer_done, disables scl_en, fires transfer_done_intrpt.
+                // Transitions to idle (4'd0) — bus_free removed in this variant.
+                // -----------------------------------------------------------
+                stop : begin
+                    scl_en       <= 1'b1;
+                    fsm_bus_ctrl <= 1'b1;
+                    scl_oe_fsm   <= 1'b0;
+                    sda_oe_fsm   <= 1'b0;
+                    data_en      <= 1'b0;
+                    shift_en     <= 1'b0;
+                    load_en      <= 1'b0;
+                    if (state_entry) stop_en <= 1'b1;
+                    if (stop_done) begin
+                        busy            <= 1'b0;
+                        xfer_done       <= 1'b1;
+                        scl_en          <= 1'b0;
+                        debug_valid_out <= 1'b1;
+                        if (transfer_done_intrpt_en) transfer_done_intrpt <= 1'b1;
+                    end
+                end
+
+                default : begin
+                    scl_oe <= 1'b0;
+                    sda_oe <= 1'b0;
+                end
+
+            endcase
+        end
+    end
+end
+
+assign i2c_interrupt = tx_fifo_empty_fsm | wdt_expry_intrpt |
+                       transfer_done_intrpt |
+                       data_nack_intrpt     |
+                       addr_nack_intrpt     |
+                       reg_addr_nack_intrpt |
+                       line_error_intrpt;
+
+endmodule
